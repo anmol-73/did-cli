@@ -16,8 +16,8 @@ HEDERA_RPC=https://your-hedera-jsonrpc-endpoint
 ## Installation
 
 ```bash
-git clone https://your-repo-url.git
-cd your-repo-folder
+git clone https://github.com/anmol-73/did-cli.git
+cd did-cli
 npm install
 ```
 
