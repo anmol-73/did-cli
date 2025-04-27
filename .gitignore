@@ -1,0 +1,14 @@
+# Node modules
+node_modules/
+
+# Hardhat build artifacts
+cache/
+
+# Environment variables
+.env
+
+# Operating System files
+.DS_Store
+
+# Coverage outputs
+coverage/

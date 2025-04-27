@@ -1,0 +1,349 @@
+#!/usr/bin/env node
+
+require("dotenv").config();
+const fs = require("fs");
+const path = require("path");
+const { Command } = require("commander");
+const {
+	JsonRpcProvider,
+	Wallet,
+	ContractFactory,
+	Contract,
+	randomBytes,
+	hexlify,
+	toUtf8Bytes,
+	verifyMessage,
+	getAddress,
+} = require("ethers");
+
+const program = new Command();
+program.name("did-cli").version("1.0.0");
+
+// Load environment variables
+const { PRIVATE_KEY, HEDERA_RPC } = process.env;
+if (!PRIVATE_KEY || !HEDERA_RPC) {
+	console.error("Error: Missing PRIVATE_KEY or HEDERA_RPC in .env");
+	process.exit(1);
+}
+
+const provider = new JsonRpcProvider(HEDERA_RPC);
+const wallet = new Wallet(PRIVATE_KEY, provider);
+
+// Load compiled DIDRegistry contract
+const artifactPath = path.resolve(
+	__dirname,
+	"./artifacts/contracts/DidRegistry.sol/DIDRegistry.json"
+);
+if (!fs.existsSync(artifactPath)) {
+	console.error(`Error: Contract artifact not found at ${artifactPath}`);
+	process.exit(1);
+}
+const { abi: didRegistryAbi, bytecode: didRegistryBytecode } = JSON.parse(
+	fs.readFileSync(artifactPath, "utf-8")
+);
+
+// Simple on-disk wallet for storing VCs
+const WALLET_PATH = path.resolve(process.cwd(), "wallet.json");
+function loadWallet() {
+	if (!fs.existsSync(WALLET_PATH)) return [];
+	try {
+		const text = fs.readFileSync(WALLET_PATH, "utf-8").trim();
+		return text ? JSON.parse(text) : [];
+	} catch {
+		console.error(`Warning: Could not parse ${WALLET_PATH}, starting empty`);
+		return [];
+	}
+}
+function saveWallet(creds) {
+	fs.writeFileSync(WALLET_PATH, JSON.stringify(creds, null, 2));
+}
+
+// Ensure deterministic JSON for signing/verifying
+function canonicalize(obj) {
+	if (Array.isArray(obj)) return obj.map(canonicalize);
+	if (obj && typeof obj === "object") {
+		const sorted = {};
+		Object.keys(obj)
+			.sort()
+			.forEach((k) => {
+				sorted[k] = canonicalize(obj[k]);
+			});
+		return sorted;
+	}
+	return obj;
+}
+
+// Deploy or attach to the DID registry contract
+async function deployRegistry() {
+	const factory = new ContractFactory(
+		didRegistryAbi,
+		didRegistryBytecode,
+		wallet
+	);
+	const contract = await factory.deploy();
+	await contract.waitForDeployment();
+	return contract;
+}
+function attachRegistry(address) {
+	return new Contract(address, didRegistryAbi, wallet);
+}
+
+// Issue a Verifiable Credential
+async function issueVerifiableCredential(issuerWallet, subjectDid, claims) {
+	const issuanceDate = new Date().toISOString();
+	const credential = {
+		"@context": ["https://www.w3.org/2018/credentials/v1"],
+		id: `urn:uuid:${hexlify(randomBytes(16))}`,
+		type: ["VerifiableCredential"],
+		issuer: `did:hedera:${await issuerWallet.getAddress()}`,
+		issuanceDate,
+		credentialSubject: { id: subjectDid, ...claims },
+	};
+	const msg = toUtf8Bytes(JSON.stringify(canonicalize(credential)));
+	const signature = await issuerWallet.signMessage(msg);
+	credential.proof = {
+		type: "EcdsaSecp256k1Signature2020",
+		created: issuanceDate,
+		proofPurpose: "assertionMethod",
+		verificationMethod: `${credential.issuer}#keys-1`,
+		jws: signature,
+	};
+	return credential;
+}
+
+// Create a Verifiable Presentation with selective disclosure
+async function createVerifiablePresentation(
+	holderWallet,
+	vcs,
+	holderDid,
+	revealMap
+) {
+	const filteredVCs = vcs.map((vc) => {
+		const keys = revealMap[vc.id] || [];
+		const subject = { id: vc.credentialSubject.id };
+		keys.forEach((k) => {
+			if (vc.credentialSubject[k] !== undefined) {
+				subject[k] = vc.credentialSubject[k];
+			}
+		});
+		return { ...vc, credentialSubject: subject };
+	});
+
+	const presentation = {
+		"@context": ["https://www.w3.org/2018/credentials/v1"],
+		type: ["VerifiablePresentation"],
+		verifiableCredential: filteredVCs,
+		holder: holderDid,
+	};
+	const msg = toUtf8Bytes(JSON.stringify(canonicalize(presentation)));
+	const signature = await holderWallet.signMessage(msg);
+	presentation.proof = {
+		type: "EcdsaSecp256k1Signature2020",
+		created: new Date().toISOString(),
+		proofPurpose: "authentication",
+		verificationMethod: `${holderDid}#keys-1`,
+		jws: signature,
+	};
+	return presentation;
+}
+
+// Verify a Verifiable Presentation and its embedded VCs
+async function verifyVerifiablePresentation(vp, registry, fullVcs) {
+	// Verify holder signature
+	const { proof: presProof, verifiableCredential, holder } = vp;
+	const presPayload = {
+		"@context": vp["@context"],
+		type: vp.type,
+		verifiableCredential,
+		holder,
+	};
+	const recoveredHolder = verifyMessage(
+		toUtf8Bytes(JSON.stringify(canonicalize(presPayload))),
+		presProof.jws
+	);
+	if (recoveredHolder.toLowerCase() !== holder.split(":").pop().toLowerCase()) {
+		console.error("Error: Holder signature mismatch");
+		return false;
+	}
+
+	// Verify each VC's issuer signature
+	for (const vc of verifiableCredential) {
+		const issuerDid = vc.issuer;
+		const issuerAddr = issuerDid.split(":").pop();
+		const fullVc = fullVcs.find((x) => x.id === vc.id);
+		if (!fullVc) {
+			console.error(`Error: Missing full VC ${vc.id}`);
+			return false;
+		}
+		const { proof: vcProof, ...fullNoProof } = fullVc;
+		const recoveredIssuer = verifyMessage(
+			JSON.stringify(canonicalize(fullNoProof)),
+			vcProof.jws
+		);
+		if (recoveredIssuer.toLowerCase() !== issuerAddr.toLowerCase()) {
+			console.error(`Error: VC signature invalid for ${vc.id}`);
+			return false;
+		}
+	}
+
+	return true;
+}
+
+// ── CLI Commands ────────────────────────────────────────────────────────────────
+
+// Deploy a new registry
+program
+	.command("deploy")
+	.description("Deploy a new DID registry")
+	.action(async () => {
+		try {
+			const contract = await deployRegistry();
+			console.log("Registry deployed at:", await contract.getAddress());
+		} catch (err) {
+			console.error("deploy failed:", err.message);
+			process.exit(1);
+		}
+	});
+
+// Register a DID on-chain (or generate one if omitted)
+program
+	.command("did:create [did]")
+	.description("Register a DID on the registry")
+	.requiredOption("-r, --registry <address>", "Registry contract address")
+	.action(async (did, opts) => {
+		try {
+			const registry = attachRegistry(opts.registry);
+			const controller = await wallet.getAddress();
+			const finalDid = did || `did:hedera:${Wallet.createRandom().address}`;
+			const tx = await registry.createDID(finalDid, controller);
+			await tx.wait();
+			console.log(`Registered ${finalDid} → controller ${controller}`);
+		} catch (err) {
+			console.error("did:create failed:", err.message);
+			process.exit(1);
+		}
+	});
+
+// Fetch a DID’s controller
+program
+	.command("did:get-controller <did>")
+	.description("Get controller address for a DID")
+	.requiredOption("-r, --registry <address>")
+	.action(async (did, opts) => {
+		try {
+			const registry = attachRegistry(opts.registry);
+			const c = await registry.getController(did);
+			console.log("Controller:", c);
+		} catch (err) {
+			console.error("did:get-controller failed:", err.message);
+			process.exit(1);
+		}
+	});
+
+// Rotate a DID’s controller (or auto-generate one)
+program
+	.command("did:update-controller <did> [newController]")
+	.description("Update the controller for a DID")
+	.requiredOption("-r, --registry <address>")
+	.action(async (did, newCtrl, opts) => {
+		try {
+			const registry = attachRegistry(opts.registry);
+			const controller = newCtrl || Wallet.createRandom().address;
+			const tx = await registry.updateController(did, controller);
+			await tx.wait();
+			console.log(`Updated ${did} → new controller ${controller}`);
+		} catch (err) {
+			console.error("did:update-controller failed:", err.message);
+			process.exit(1);
+		}
+	});
+
+// Issue a new Verifiable Credential
+program
+	.command("vc:issue <subjectDid>")
+	.description("Issue and store a verifiable credential")
+	.requiredOption("-r, --registry <address>")
+	.requiredOption("--claims-file <path>", "Path to claims JSON")
+	.action(async (subjectDid, opts) => {
+		try {
+			const registry = attachRegistry(opts.registry);
+			const issuerDid = `did:hedera:${await wallet.getAddress()}`;
+			if (!(await registry.getController(issuerDid))) {
+				throw new Error("Issuer DID not registered");
+			}
+			const claims = JSON.parse(fs.readFileSync(opts.claimsFile, "utf8"));
+			const vc = await issueVerifiableCredential(wallet, subjectDid, claims);
+			const all = loadWallet();
+			all.push(vc);
+			saveWallet(all);
+			console.log("VC issued and stored:", vc.id);
+		} catch (err) {
+			console.error("vc:issue failed:", err.message);
+			process.exit(1);
+		}
+	});
+
+// List stored credentials
+program
+	.command("vc:list")
+	.description("List all stored verifiable credentials")
+	.action(() => {
+		const all = loadWallet();
+		if (!all.length) {
+			console.log("No credentials in wallet.json");
+			return;
+		}
+		all.forEach((vc, i) => {
+			console.log(`${i + 1}. ${vc.id} (subject ${vc.credentialSubject.id})`);
+		});
+	});
+
+// Create a verifiable presentation
+program
+	.command("vp:create")
+	.description("Create a verifiable presentation")
+	.requiredOption("--reveal-file <path>", "JSON file with reveal map")
+	.option("-o, --output <path>", "Write output to file")
+	.action(async (opts) => {
+		try {
+			const holderDid = `did:hedera:${await wallet.getAddress()}`;
+			const revealMap = JSON.parse(fs.readFileSync(opts.revealFile, "utf8"));
+			const vcs = loadWallet();
+			const vp = await createVerifiablePresentation(
+				wallet,
+				vcs,
+				holderDid,
+				revealMap
+			);
+			const out = JSON.stringify(vp, null, 2);
+			if (opts.output) {
+				fs.writeFileSync(opts.output, out);
+				console.log(`Presentation saved to ${opts.output}`);
+			} else {
+				console.log(out);
+			}
+		} catch (err) {
+			console.error("vp:create failed:", err.message);
+			process.exit(1);
+		}
+	});
+
+// Verify a verifiable presentation
+program
+	.command("vp:verify")
+	.description("Verify a verifiable presentation")
+	.requiredOption("-r, --registry <address>")
+	.requiredOption("-f, --vp-file <path>", "Presentation JSON file")
+	.action(async (opts) => {
+		try {
+			const registry = attachRegistry(opts.registry);
+			const vp = JSON.parse(fs.readFileSync(opts.vpFile, "utf8"));
+			const ok = await verifyVerifiablePresentation(vp, registry, loadWallet());
+			console.log("Presentation valid?", ok);
+		} catch (err) {
+			console.error("vp:verify failed:", err.message);
+			process.exit(1);
+		}
+	});
+
+program.parse(process.argv);
